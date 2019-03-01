@@ -24,7 +24,7 @@ from fairseq.meters import AverageMeter, StopwatchMeter
 from fairseq.utils import import_user_module
 
 
-def main(args):
+def main(args, init_distributed=False):
     import_user_module(args)
 
     if args.max_tokens is None:
@@ -40,6 +40,12 @@ def main(args):
 
     # Load dataset splits
     load_dataset_splits(task, ['train', 'valid'])
+
+    # Initialize distributed training (after data loading)
+    if init_distributed:
+        import socket
+        args.distributed_rank = distributed_utils.distributed_init(args)
+        print('| initialized host {} as rank {}'.format(socket.gethostname(), args.distributed_rank))
 
     # Build model and criterion
     model = task.build_model(args)
@@ -116,13 +122,11 @@ def train(args, trainer, task, epoch_itr):
     """Train the model for one epoch."""
 
     # Update parameters every N batches
-    if epoch_itr.epoch <= len(args.update_freq):
-        update_freq = args.update_freq[epoch_itr.epoch - 1]
-    else:
-        update_freq = args.update_freq[-1]
 
     # Initialize data iterator
     itr = epoch_itr.next_epoch_itr(fix_batches_to_gpus=args.fix_batches_to_gpus)
+    update_freq = args.update_freq[epoch_itr.epoch - 1] \
+            if epoch_itr.epoch <= len(args.update_freq) else args.update_freq[-1]
     itr = iterators.GroupedIterator(itr, update_freq)
     progress = progress_bar.build_progress_bar(
         args, itr, epoch_itr.epoch, no_progress_bar='simple',
@@ -146,7 +150,7 @@ def train(args, trainer, task, epoch_itr):
             else:
                 extra_meters[k].update(v)
             stats[k] = extra_meters[k].avg
-        progress.log(stats)
+        progress.log(stats, tag='train', step=stats['num_updates'])
 
         # ignore the first mini-batch in words-per-second calculation
         if i == 0:
@@ -164,7 +168,7 @@ def train(args, trainer, task, epoch_itr):
     stats = get_training_stats(trainer)
     for k, meter in extra_meters.items():
         stats[k] = meter.avg
-    progress.print(stats)
+    progress.print(stats, tag='train', step=stats['num_updates'])
 
     # reset training meters
     for k in [
@@ -177,26 +181,26 @@ def train(args, trainer, task, epoch_itr):
 
 def get_training_stats(trainer):
     stats = collections.OrderedDict()
-    stats['loss'] = '{:.3f}'.format(trainer.get_meter('train_loss').avg)
+    stats['loss'] = trainer.get_meter('train_loss')
     if trainer.get_meter('train_nll_loss').count > 0:
-        nll_loss = trainer.get_meter('train_nll_loss').avg
-        stats['nll_loss'] = '{:.3f}'.format(nll_loss)
+        nll_loss = trainer.get_meter('train_nll_loss')
+        stats['nll_loss'] = nll_loss
     else:
-        nll_loss = trainer.get_meter('train_loss').avg
-    stats['ppl'] = get_perplexity(nll_loss)
-    stats['wps'] = round(trainer.get_meter('wps').avg)
-    stats['ups'] = '{:.1f}'.format(trainer.get_meter('ups').avg)
-    stats['wpb'] = round(trainer.get_meter('wpb').avg)
-    stats['bsz'] = round(trainer.get_meter('bsz').avg)
+        nll_loss = trainer.get_meter('train_loss')
+    stats['ppl'] = get_perplexity(nll_loss.avg)
+    stats['wps'] = trainer.get_meter('wps')
+    stats['ups'] = trainer.get_meter('ups')
+    stats['wpb'] = trainer.get_meter('wpb')
+    stats['bsz'] = trainer.get_meter('bsz')
     stats['num_updates'] = trainer.get_num_updates()
     stats['lr'] = trainer.get_lr()
-    stats['gnorm'] = '{:.3f}'.format(trainer.get_meter('gnorm').avg)
-    stats['clip'] = '{:.0%}'.format(trainer.get_meter('clip').avg)
-    stats['oom'] = trainer.get_meter('oom').avg
+    stats['gnorm'] = trainer.get_meter('gnorm')
+    stats['clip'] = trainer.get_meter('clip')
+    stats['oom'] = trainer.get_meter('oom')
     if trainer.get_meter('loss_scale') is not None:
-        stats['loss_scale'] = '{:.3f}'.format(trainer.get_meter('loss_scale').avg)
+        stats['loss_scale'] = trainer.get_meter('loss_scale')
     stats['wall'] = round(trainer.get_meter('wall').elapsed_time)
-    stats['train_wall'] = round(trainer.get_meter('train_wall').sum)
+    stats['train_wall'] = trainer.get_meter('train_wall')
     return stats
 
 
@@ -245,24 +249,24 @@ def validate(args, trainer, task, epoch_itr, subsets):
         stats = get_valid_stats(trainer)
         for k, meter in extra_meters.items():
             stats[k] = meter.avg
-        progress.print(stats)
+        progress.print(stats, tag=subset, step=trainer.get_num_updates())
 
-        valid_losses.append(stats['valid_loss'])
+        valid_losses.append(stats['loss'].avg)
     return valid_losses
 
 
 def get_valid_stats(trainer):
     stats = collections.OrderedDict()
-    stats['valid_loss'] = trainer.get_meter('valid_loss').avg
+    stats['loss'] = trainer.get_meter('valid_loss')
     if trainer.get_meter('valid_nll_loss').count > 0:
-        nll_loss = trainer.get_meter('valid_nll_loss').avg
-        stats['valid_nll_loss'] = nll_loss
+        nll_loss = trainer.get_meter('valid_nll_loss')
+        stats['nll_loss'] = nll_loss
     else:
-        nll_loss = trainer.get_meter('valid_loss').avg
-    stats['valid_ppl'] = get_perplexity(nll_loss)
+        nll_loss = stats['loss']
+    stats['ppl'] = get_perplexity(nll_loss.avg)
     stats['num_updates'] = trainer.get_num_updates()
     if hasattr(save_checkpoint, 'best'):
-        stats['best'] = min(save_checkpoint.best, stats['valid_loss'])
+        stats['best_loss'] = min(save_checkpoint.best, stats['loss'].avg)
     return stats
 
 
@@ -328,7 +332,10 @@ def save_checkpoint(args, trainer, epoch_itr, val_loss):
 def load_checkpoint(args, trainer, epoch_itr):
     """Load a checkpoint and replay dataloader to match."""
     os.makedirs(args.save_dir, exist_ok=True)
-    checkpoint_path = os.path.join(args.save_dir, args.restore_file)
+    if os.path.isabs(args.restore_file):
+        checkpoint_path = args.restore_file
+    else:
+        checkpoint_path = os.path.join(args.save_dir, args.restore_file)
     if os.path.isfile(checkpoint_path):
         extra_state = trainer.load_checkpoint(checkpoint_path, args.reset_optimizer, args.reset_lr_scheduler,
                                               eval(args.optimizer_overrides))
@@ -344,6 +351,8 @@ def load_checkpoint(args, trainer, epoch_itr):
             if 'best' in extra_state:
                 save_checkpoint.best = extra_state['best']
         return True
+    else:
+        print('| no existing checkpoint found {}'.format(checkpoint_path))
     return False
 
 
@@ -363,16 +372,13 @@ def load_dataset_splits(task, splits):
 
 
 def distributed_main(i, args):
-    import socket
     args.device_id = i
     if args.distributed_rank is None:  # torch.multiprocessing.spawn
         args.distributed_rank = i
-    args.distributed_rank = distributed_utils.distributed_init(args)
-    print('| initialized host {} as rank {}'.format(socket.gethostname(), args.distributed_rank))
-    main(args)
+    main(args, init_distributed=True)
 
 
-if __name__ == '__main__':
+def cli_main():
     parser = options.get_training_parser()
     args = options.parse_args_and_arch(parser)
 
@@ -387,18 +393,8 @@ if __name__ == '__main__':
         port = random.randint(10000, 20000)
         args.distributed_init_method = 'tcp://localhost:{port}'.format(port=port)
         args.distributed_rank = None  # set based on device id
-        print(
-            '''| NOTE: you may get better performance with:
-
-            python -m torch.distributed.launch --nproc_per_node {ngpu} train.py {no_c10d}(...)
-            '''.format(
-                ngpu=args.distributed_world_size,
-                no_c10d=(
-                    '--ddp-backend=no_c10d ' if max(args.update_freq) > 1 and args.ddp_backend != 'no_c10d'
-                    else ''
-                ),
-            )
-        )
+        if max(args.update_freq) > 1 and args.ddp_backend != 'no_c10d':
+            print('| NOTE: you may get better performance with: --ddp-backend=no_c10d')
         torch.multiprocessing.spawn(
             fn=distributed_main,
             args=(args, ),
@@ -407,3 +403,7 @@ if __name__ == '__main__':
     else:
         # single GPU training
         main(args)
+
+
+if __name__ == '__main__':
+    cli_main()

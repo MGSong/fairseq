@@ -39,7 +39,7 @@ def convert_state_dict_type(state_dict, ttype=torch.FloatTensor):
         return state_dict
 
 
-def save_state(filename, args, model, criterion, optimizer, lr_scheduler,
+def save_state(filename, args, model_state_dict, criterion, optimizer, lr_scheduler,
                num_updates, optim_history=None, extra_state=None):
     if optim_history is None:
         optim_history = []
@@ -47,7 +47,7 @@ def save_state(filename, args, model, criterion, optimizer, lr_scheduler,
         extra_state = {}
     state_dict = {
         'args': args,
-        'model': model.state_dict() if model else {},
+        'model': model_state_dict if model_state_dict else {},
         'optimizer_history': optim_history + [
             {
                 'criterion_name': criterion.__class__.__name__,
@@ -304,7 +304,7 @@ def post_process_prediction(hypo_tokens, src_str, alignment, align_dict, tgt_dic
     if align_dict is not None or remove_bpe is not None:
         # Convert back to tokens for evaluating with unk replacement or without BPE
         # Note that the dictionary can be modified inside the method.
-        hypo_tokens = tokenizer.Tokenizer.tokenize(hypo_str, tgt_dict, add_if_not_exist=True)
+        hypo_tokens = tgt_dict.encode_line(hypo_str, add_if_not_exist=True)
     return hypo_tokens, hypo_str, alignment
 
 
@@ -438,14 +438,12 @@ def resolve_max_positions(*args):
 
 
 def import_user_module(args):
-    if hasattr(args, 'user_dir'):
-        module_path = args.user_dir
+    module_path = getattr(args, 'user_dir', None)
+    if module_path is not None:
+        module_path = os.path.abspath(args.user_dir)
+        module_parent, module_name = os.path.split(module_path)
 
-        if module_path is not None:
-            module_path = os.path.abspath(args.user_dir)
-            module_parent, module_name = os.path.split(module_path)
-
-            if module_name not in sys.modules:
-                sys.path.insert(0, module_parent)
-                importlib.import_module(module_name)
-                sys.path.pop(0)
+        if module_name not in sys.modules:
+            sys.path.insert(0, module_parent)
+            importlib.import_module(module_name)
+            sys.path.pop(0)

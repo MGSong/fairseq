@@ -7,7 +7,6 @@
 
 import contextlib
 import os
-
 import numpy as np
 
 
@@ -92,9 +91,10 @@ def filter_by_size(indices, size_fn, max_positions, raise_exception=False):
             assert isinstance(idx_size, dict)
             intersect_keys = set(max_positions.keys()) & set(idx_size.keys())
             return all(
-                       all(a is None or b is None or a <= b
-                           for a, b in zip(idx_size[key], max_positions[key]))
-                       for key in intersect_keys)
+                all(a is None or b is None or a <= b
+                    for a, b in zip(idx_size[key], max_positions[key]))
+                for key in intersect_keys
+            )
         else:
             return all(a is None or b is None or a <= b
                        for a, b in zip(size_fn(idx), max_positions))
@@ -172,3 +172,11 @@ def batch_by_size(
 
     if len(batch) > 0:
         yield batch
+
+
+def process_bpe_symbol(sentence: str, bpe_symbol: str):
+    if bpe_symbol == 'sentencepiece':
+        sentence = sentence.replace('\u2581', ' ').strip()
+    elif bpe_symbol is not None:
+        sentence = (sentence + ' ').replace(bpe_symbol, '').rstrip()
+    return sentence
